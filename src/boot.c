@@ -718,6 +718,7 @@ interactive_bootmenu(void)
         char *bootmsg = romfile_loadfile("etc/boot-menu-message", NULL);
         printf("%s", bootmsg ?: "\nPress ESC for boot menu.\n\n");
         free(bootmsg);
+        //tpm_setup();
 
         enable_bootsplash();
         scan_code = get_keystroke(menutime);

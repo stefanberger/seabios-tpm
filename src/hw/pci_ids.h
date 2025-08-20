@@ -2624,6 +2624,7 @@
 /* virtio 0.9.5 ids (legacy/transitional devices) */
 #define PCI_DEVICE_ID_VIRTIO_BLK_09	0x1001
 #define PCI_DEVICE_ID_VIRTIO_SCSI_09	0x1004
+#define PCI_DEVICE_ID_VIRTIO_TPM        0x102a
 /* virtio 1.0 ids (modern devices) */
 #define PCI_DEVICE_ID_VIRTIO_BLK_10	0x1042
 #define PCI_DEVICE_ID_VIRTIO_SCSI_10	0x1048

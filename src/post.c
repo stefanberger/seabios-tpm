@@ -129,6 +129,7 @@ device_hardware_setup(void)
     usb_setup();
     ps2port_setup();
     block_setup();
+    tpm_setup();
     lpt_setup();
     serial_setup();
     cbfs_payload_setup();

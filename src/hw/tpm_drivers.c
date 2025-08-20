@@ -12,6 +12,8 @@
 #include "hw/tpm_drivers.h" // struct tpm_driver
 #include "std/tcg.h" // TCG_RESPONSE_TIMEOUT
 #include "output.h" // warn_timeout
+#include "pcidevice.h" // foreachpci
+#include "pci_ids.h" // PCI_DEVICE_ID_TPM
 #include "stacks.h" // yield
 #include "string.h" // memcpy
 #include "util.h" // timer_calc_usec
@@ -37,7 +39,8 @@ extern struct tpm_driver tpm_drivers[];
 
 #define TIS_DRIVER_IDX       0
 #define CRB_DRIVER_IDX       1
-#define TPM_NUM_DRIVERS      2
+#define VIRTIO_DRIVER_IDX    2
+#define TPM_NUM_DRIVERS      3
 
 #define TPM_INVALID_DRIVER   0xf
 
@@ -535,6 +538,174 @@ static u32 crb_waitrespready(enum tpmDurationType to_t)
     return rc;
 }
 
+#include "virtio-pci.h" // vp_device
+#include "malloc.h" // malloc_low
+#include "virtio-ring.h"
+
+
+struct tpm_virtio_device
+{
+    struct vp_device vp;
+    struct vring_virtqueue *o_vq;
+    struct vring_virtqueue *i_vq;
+};
+
+static struct tpm_virtio_device *tpm;
+
+static u32 virtio_probe(void)
+{
+    if (!CONFIG_TCGBIOS)
+        return 0;
+
+    ASSERT32FLAT();
+
+    struct pci_device *pci;
+    foreachpci(pci) {
+        if (pci->vendor != PCI_VENDOR_ID_REDHAT_QUMRANET ||
+            (pci->device != PCI_DEVICE_ID_VIRTIO_TPM))
+            continue;
+        printf("FOUND TPM on PCI!\n");
+        tpm = malloc_low(sizeof(*tpm));
+        memset(tpm, 0, sizeof(*tpm));
+        vp_init_simple(&tpm->vp, pci);
+        struct vp_device *vp = &tpm->vp;
+        u64 features = vp_get_features(vp);
+        printf("features: 0x%0llx\n", features);
+        if (vp_find_vq(&tpm->vp, 0, &tpm->o_vq) < 0) {
+            printf("failed to find o_vq for virtio-tpm %dP\n", pci);
+            goto fail;
+        }
+        if (vp_find_vq(&tpm->vp, 1, &tpm->i_vq) < 0) {
+            printf("failed to find i_vq for virtio-tpm %dP\n", pci);
+            goto fail;
+        }
+        u8 status = VIRTIO_CONFIG_S_ACKNOWLEDGE | VIRTIO_CONFIG_S_DRIVER;
+        status |= VIRTIO_CONFIG_S_DRIVER_OK;
+        vp_set_status(&tpm->vp, status);
+
+        return 1;
+    }
+
+    return 0;
+fail:
+    vp_reset(&tpm->vp);
+    free(tpm->o_vq);
+    free(tpm);
+    return 0;
+}
+
+static TPMVersion virtio_get_tpm_version(void)
+{
+    /* Virtio is supposed to be TPM 2.0 only */
+    return TPM_VERSION_2;
+}
+
+static u32 virtio_init(void)
+{
+    if (!CONFIG_TCGBIOS)
+        return 1;
+
+    init_timeout(VIRTIO_DRIVER_IDX);
+
+    return 0;
+}
+
+static u32 virtio_activate(u8 locty)
+{
+    if (!CONFIG_TCGBIOS)
+        return 0;
+
+    return 0;
+}
+
+char recv_buffer[128];
+    struct vring_list recv_sg[] = {
+        {
+            .addr = recv_buffer,
+            .length = sizeof(recv_buffer),
+        },
+    };
+
+static u32 virtio_senddata(const u8 *const data, u32 len)
+{
+    if (!CONFIG_TCGBIOS)
+        return 0;
+
+    printf("SEND DATA len=%d\n", len);
+    struct vring_list sg[] = {
+        {
+            .addr = (char*)data,
+            .length = len,
+        },
+    };
+    struct vring_virtqueue *vq = tpm->o_vq;
+    vring_add_buf(vq, sg, 1, 0, 0, 0);
+    vring_kick(&tpm->vp, vq, 1);
+
+    vq = tpm->i_vq;
+    vring_add_buf(vq, recv_sg, 1, 0, 0, 0);
+    vring_kick(&tpm->vp, vq, 1);
+
+    return 0;
+}
+
+static u32 virtio_waitdatavalid(void)
+{
+    return 0;
+}
+
+static u32 virtio_waitrespready(enum tpmDurationType to_t)
+{
+    printf("WAIT RESP READY\n");
+    if (!CONFIG_TCGBIOS)
+        return 0;
+
+    u32 rc = 1;
+    u32 timeout = tpm_drivers[CRB_DRIVER_IDX].durations[to_t];
+    u32 end = timer_calc_usec(timeout);
+    struct vring_virtqueue *vq = tpm->o_vq;
+
+    for (;;) {
+        if (vring_more_used(vq)) {
+            vring_get_buf(vq, NULL);
+            rc = 0;
+            break;
+        }
+        if (timer_check(end)) {
+            warn_timeout();
+            break;
+        }
+        yield();
+    }
+    printf("GOT response: %d\n", rc);
+
+    return rc;
+}
+
+static u32 virtio_readresp(u8 *buffer, u32 *len)
+{
+    if (!CONFIG_TCGBIOS)
+        return 0;
+
+    printf("RECV DATA len=%d\n", *len);
+    struct vring_virtqueue *vq = tpm->i_vq;
+
+    while (!vring_more_used(vq))
+        usleep(5);
+
+#define MIN(A, B) ((A) < (B) ? (A) : (B))
+    memcpy(buffer, recv_buffer, MIN(*len, sizeof(recv_buffer)));
+    u32 expected = be32_to_cpu(*(u32 *) &buffer[2]);
+    printf("RECV DATA got=%d  %d\n", expected, recv_sg[0].length);
+
+    vring_get_buf(vq, NULL);
+    
+    if (*len < 6)
+        return 1;
+
+    return 0;
+}
+
 struct tpm_driver tpm_drivers[TPM_NUM_DRIVERS] = {
     [TIS_DRIVER_IDX] =
         {
@@ -565,6 +736,21 @@ struct tpm_driver tpm_drivers[TPM_NUM_DRIVERS] = {
             .readresp      = crb_readresp,
             .waitdatavalid = crb_waitdatavalid,
             .waitrespready = crb_waitrespready,
+        },
+    [VIRTIO_DRIVER_IDX] =
+        {
+            .timeouts      = NULL,
+            .durations     = NULL,
+            .set_timeouts  = set_timeouts,
+            .probe         = virtio_probe,
+            .get_tpm_version = virtio_get_tpm_version,
+            .init          = virtio_init,
+            .activate      = virtio_activate,
+            .ready         = crb_ready,
+            .senddata      = virtio_senddata,
+            .readresp      = virtio_readresp,
+            .waitdatavalid = virtio_waitdatavalid,
+            .waitrespready = virtio_waitrespready,
         },
 };
 

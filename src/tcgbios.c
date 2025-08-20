@@ -1212,8 +1212,9 @@ tpm_setup(void)
     int ret = tpm_tpm2_probe();
     if (ret) {
         ret = tpm_tcpa_probe();
-        if (ret)
-            return;
+        printf("--------------------------\n");
+//        if (ret)
+//            return;
     }
 
     TPM_version = tpmhw_probe();
