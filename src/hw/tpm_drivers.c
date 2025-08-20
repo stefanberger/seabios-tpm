@@ -12,10 +12,15 @@
 #include "hw/tpm_drivers.h" // struct tpm_driver
 #include "std/tcg.h" // TCG_RESPONSE_TIMEOUT
 #include "output.h" // warn_timeout
+#include "pcidevice.h" // foreachpci
+#include "pci_ids.h" // PCI_DEVICE_ID_TPM
 #include "stacks.h" // yield
 #include "string.h" // memcpy
 #include "util.h" // timer_calc_usec
 #include "x86.h" // readl
+#include "virtio-pci.h" // vp_device
+#include "malloc.h" // malloc_low
+#include "virtio-ring.h" // vring_*
 
 /* low level driver implementation */
 struct tpm_driver {
@@ -31,13 +36,17 @@ struct tpm_driver {
     u32 (*readresp)(u8 *buffer, u32 *len);
     u32 (*waitdatavalid)(void);
     u32 (*waitrespready)(enum tpmDurationType to_t);
+    int (*transfer)(u8 locty, void *cmd, u32 cmd_len,
+                    void *respbuffer, u32 *respbuffer_len,
+                    enum tpmDurationType to_t);
 };
 
 extern struct tpm_driver tpm_drivers[];
 
 #define TIS_DRIVER_IDX       0
 #define CRB_DRIVER_IDX       1
-#define TPM_NUM_DRIVERS      2
+#define VIRTIO_DRIVER_IDX    2
+#define TPM_NUM_DRIVERS      3
 
 #define TPM_INVALID_DRIVER   0xf
 
@@ -535,6 +544,188 @@ static u32 crb_waitrespready(enum tpmDurationType to_t)
     return rc;
 }
 
+/****************************** Virtio ******************************/
+
+struct virtio_tpm_config
+{
+    u16 buffersize;
+    u8  tpm_version;
+};
+
+struct tpm_virtio_device
+{
+    struct vp_device vp;
+    struct vring_virtqueue *vq;
+    u8 tpm_version;
+};
+
+static struct tpm_virtio_device *tpm;
+
+static u32 virtio_probe(void)
+{
+    if (!CONFIG_TCGBIOS)
+        return 0;
+
+    ASSERT32FLAT();
+
+    struct pci_device *pci;
+    foreachpci(pci) {
+        if (pci->vendor != PCI_VENDOR_ID_REDHAT_QUMRANET ||
+            (pci->device != PCI_DEVICE_ID_VIRTIO_TPM_09 &&
+             pci->device != PCI_DEVICE_ID_VIRTIO_TPM_10))
+            continue;
+
+        tpm = malloc_low(sizeof(*tpm));
+        memset(tpm, 0, sizeof(*tpm));
+
+        u8 status = VIRTIO_CONFIG_S_ACKNOWLEDGE | VIRTIO_CONFIG_S_DRIVER;
+
+        struct vp_device *vp = &tpm->vp;
+        vp_init_simple(vp, pci);
+
+        if (!vp->use_modern) {
+            dprintf(1, "TPM Virtio device must be modern\n");
+            goto fail;
+        }
+        u64 features = vp_get_features(vp);
+        u64 version1 = 1ull << VIRTIO_F_VERSION_1;
+
+        if (!(features & version1)) {
+            dprintf(1, "modern device without virtio_1 feature bit: %pP\n", pci);
+            goto fail;
+        }
+
+        features = features & (version1);
+        vp_set_features(vp, features);
+        status |= VIRTIO_CONFIG_S_FEATURES_OK;
+        vp_set_status(vp, status);
+        if (!(vp_get_status(vp) & VIRTIO_CONFIG_S_FEATURES_OK)) {
+            dprintf(0, "device didn't accept features: %pP\n", pci);
+            goto fail;
+        }
+
+        if (vp_find_vq(&tpm->vp, 0, &tpm->vq) < 0) {
+            dprintf(1, "failed to find vq for virtio-tpm %pP\n", pci);
+            goto fail;
+        }
+
+        status |= VIRTIO_CONFIG_S_DRIVER_OK;
+        vp_set_status(vp, status);
+
+        tpm->tpm_version =
+            vp_read(&vp->device, struct virtio_tpm_config, tpm_version);
+
+        return 1;
+    }
+
+    return 0;
+
+fail:
+    vp_reset(&tpm->vp);
+    free(tpm->vq);
+    free(tpm);
+    return 0;
+}
+
+static TPMVersion virtio_get_tpm_version(void)
+{
+    return tpm->tpm_version;
+}
+
+static u32 virtio_init(void)
+{
+    if (!CONFIG_TCGBIOS)
+        return 1;
+
+    init_timeout(VIRTIO_DRIVER_IDX);
+
+    return 0;
+}
+
+static u32 virtio_waitrespready(struct vring_virtqueue *vq,
+                                enum tpmDurationType to_t)
+{
+    if (!CONFIG_TCGBIOS)
+        return 0;
+
+    u32 rc = 1;
+    u32 timeout = tpm_drivers[VIRTIO_DRIVER_IDX].durations[to_t];
+    u32 end = timer_calc_usec(timeout);
+
+    for (;;) {
+        if (vring_more_used(vq)) {
+            rc = 0;
+            break;
+        }
+        if (timer_check(end)) {
+            warn_timeout();
+            break;
+        }
+        yield();
+    }
+
+    return rc;
+}
+
+static int virtio_transfer(u8 locty, void *cmd, u32 cmd_len,
+                           void *respbuffer, u32 *respbufferlen,
+                           enum tpmDurationType to_t)
+{
+    struct virtio_tpm_cmd_header {
+        u8 locty;
+    } hdr = {
+        .locty = locty,
+    };
+    struct virtio_tpm_cmd_result {
+        u8 status;
+    } result;
+    struct vring_list sg[] = {
+        {
+            .addr = (char *)&hdr,
+            .length = sizeof(hdr),
+        }, {
+            .addr = cmd,
+            .length = cmd_len,
+        }, {
+            .addr = respbuffer,
+            .length = *respbufferlen,
+        }, {
+            .addr = (char *)&result,
+            .length = sizeof(result),
+        }
+    };
+    struct vring_virtqueue *vq;
+    unsigned char *d = cmd;
+    int ret = 0;
+
+    printf("tpm: TRANSFER: cmd %p  respbuflen=%d   %02x %02x %02x %02x %02x %02x\n",
+            cmd, *respbufferlen, d[0], d[1], d[2], d[3], d[4], d[5]);
+
+    if (*respbufferlen < 10)
+        return -1;
+
+    vq = tpm->vq;
+    vring_add_buf(vq, sg, 2, 2, 0, 0);
+    vring_kick(&tpm->vp, vq, 1);
+
+    u32 irc = virtio_waitrespready(tpm->vq, to_t);
+    if (irc) {
+        ret = -1;
+        goto error;
+    }
+
+    d = (unsigned char *)respbuffer;
+    u32 expected = be32_to_cpu(*(u32 *) &d[2]);
+    printf("tpm: RECV DATA got=0x%08x  status=0x%02x   %02x %02x %02x %02x %02x %02x\n",
+           expected, result.status, d[0], d[1], d[2], d[3], d[4], d[5]);
+
+error:
+    vring_get_buf(tpm->vq, NULL);
+    vp_get_isr(&tpm->vp);
+
+    return ret;
+}
+
 struct tpm_driver tpm_drivers[TPM_NUM_DRIVERS] = {
     [TIS_DRIVER_IDX] =
         {
@@ -565,6 +756,16 @@ struct tpm_driver tpm_drivers[TPM_NUM_DRIVERS] = {
             .readresp      = crb_readresp,
             .waitdatavalid = crb_waitdatavalid,
             .waitrespready = crb_waitrespready,
+        },
+    [VIRTIO_DRIVER_IDX] =
+        {
+            .timeouts      = NULL,
+            .durations     = NULL,
+            .set_timeouts  = set_timeouts,
+            .probe         = virtio_probe,
+            .get_tpm_version = virtio_get_tpm_version,
+            .init          = virtio_init,
+            .transfer      = virtio_transfer,
         },
 };
 
@@ -600,6 +801,11 @@ tpmhw_transmit(u8 locty, struct tpm_req_header *req,
         return -1;
 
     struct tpm_driver *td = &tpm_drivers[TPMHW_driver_to_use];
+
+    if (td->transfer) {
+         return td->transfer(locty, (void*)req, be32_to_cpu(req->totlen),
+                             respbuffer, respbufferlen, to_t);
+    }
 
     u32 irc = td->activate(locty);
     if (irc != 0) {

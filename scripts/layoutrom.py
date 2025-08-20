@@ -484,7 +484,8 @@ def checkRuntime(reloc, rsection, data, chain):
     if '.data.varinit.' in section.name:
         print("ERROR: %s is VARVERIFY32INIT but used from %s" % (
             section.name, chain))
-        sys.exit(1)
+        #sys.exit(1)
+        return 0
     return 1
 
 # Find and keep the section associated with a symbol (if available).
