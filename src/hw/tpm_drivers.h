@@ -18,6 +18,8 @@ typedef u8 TPMVersion;
 
 TPMVersion tpmhw_probe(void);
 int tpmhw_is_present(void);
+
+int tpmhw_supports_s3_resume(void);
 struct tpm_req_header;
 int tpmhw_transmit(u8 locty, struct tpm_req_header *req,
                    void *respbuffer, u32 *respbufferlen,

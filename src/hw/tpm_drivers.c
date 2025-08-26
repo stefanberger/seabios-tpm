@@ -39,6 +39,7 @@ struct tpm_driver {
     int (*transfer)(u8 locty, void *cmd, u32 cmd_len,
                     void *respbuffer, u32 *respbuffer_len,
                     enum tpmDurationType to_t);
+    int s3_resume;
 };
 
 extern struct tpm_driver tpm_drivers[];
@@ -741,6 +742,7 @@ struct tpm_driver tpm_drivers[TPM_NUM_DRIVERS] = {
             .readresp      = tis_readresp,
             .waitdatavalid = tis_waitdatavalid,
             .waitrespready = tis_waitrespready,
+            .s3_resume     = 1,
         },
     [CRB_DRIVER_IDX] =
         {
@@ -756,6 +758,7 @@ struct tpm_driver tpm_drivers[TPM_NUM_DRIVERS] = {
             .readresp      = crb_readresp,
             .waitdatavalid = crb_waitdatavalid,
             .waitrespready = crb_waitrespready,
+            .s3_resume     = 1,
         },
     [VIRTIO_DRIVER_IDX] =
         {
@@ -766,6 +769,7 @@ struct tpm_driver tpm_drivers[TPM_NUM_DRIVERS] = {
             .get_tpm_version = virtio_get_tpm_version,
             .init          = virtio_init,
             .transfer      = virtio_transfer,
+            .s3_resume     = 0,
         },
 };
 
@@ -790,6 +794,12 @@ int
 tpmhw_is_present(void)
 {
     return TPMHW_driver_to_use != TPM_INVALID_DRIVER;
+}
+
+int
+tpmhw_supports_s3_resume(void)
+{
+    return tpm_drivers[TPMHW_driver_to_use].s3_resume;
 }
 
 int

@@ -1366,6 +1366,9 @@ tpm_s3_resume(void)
     if (!tpm_is_working())
         return;
 
+    if (!tpmhw_supports_s3_resume())
+        return;
+
     dprintf(DEBUG_tcg, "TCGBIOS: Resuming with TPM_Startup(ST_STATE)\n");
 
     int ret = -1;
